@@ -11,6 +11,17 @@ htmlcov/
 
 .env
 .env.*
+*.env
+
+# AWS Credentials
+aws-credentials.txt
+credentials.txt
+*credentials*
+*secrets*
+
+# API Keys
+*api-key*
+*apikey*
 
 # IDE / OS
 .vscode/
