@@ -1,0 +1,6 @@
+
+[project]
+name = "resume-parser-service"
+version = "1.1.0"
+description = "Parse-only resume parsing microservice"
+requires-python = ">=3.11"
