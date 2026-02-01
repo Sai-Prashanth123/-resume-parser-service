@@ -9,7 +9,7 @@ import os
 
 from botocore.exceptions import NoCredentialsError, ClientError
 
-# Load .env automatically for local dev (AWS creds, region, GROQ key, etc.)
+# Load .env automatically for local dev (AWS creds, region, etc.)
 try:
     from dotenv import load_dotenv
     load_dotenv()
