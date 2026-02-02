@@ -1,11 +1,24 @@
 
-from app.parsing.text_extract import extract_text
+import os
+
+from app.parsing.text_extract import extract_text_and_meta
 from app.parsing.sectioner import split_sections
 from app.parsing.personal import extract_personal
 from app.parsing.experience import parse_experience
 from app.parsing.education import parse_education
 from app.parsing.skills import consolidate_skills
 from app.parsing.social_links import extract_social_links
+from app.parsing.postprocess import postprocess_result
+
+
+def _truncate(s: str, limit: int) -> tuple[str, bool]:
+    if s is None:
+        return "", False
+    if limit <= 0:
+        return "", True
+    if len(s) <= limit:
+        return s, False
+    return s[:limit], True
 
 def _to_profile_service_shape(result: dict) -> dict:
     """
@@ -77,35 +90,39 @@ def _convert_date_to_frontend_format(date_str):
     
     import re
     from datetime import datetime
-    
-    date_str = date_str.strip()
-    
-    # Try to parse "January 2025" or "Jan 2025"
-    month_year_match = re.match(r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{4})', date_str, re.I)
-    if month_year_match:
-        try:
-            dt = datetime.strptime(date_str, '%B %Y')
-            return dt.strftime('%Y-%m-%d')
-        except:
-            try:
-                dt = datetime.strptime(date_str, '%b %Y')
-                return dt.strftime('%Y-%m-%d')
-            except:
-                pass
-    
-    # Try to parse "01/2025" or "1/2025"
-    mm_yyyy_match = re.match(r'(\d{1,2})/(\d{4})', date_str)
+    from dateutil import parser as date_parser
+
+    date_str = (date_str or "").strip()
+    if not date_str:
+        return None
+
+    # Normalize unicode dashes and remove parentheses
+    date_str = date_str.replace("–", "-").replace("—", "-")
+    date_str = re.sub(r"[\(\)]", "", date_str).strip()
+
+    # Present/current should be represented as null endDate upstream
+    if re.fullmatch(r"(present|current|now)", date_str, flags=re.I):
+        return None
+
+    # Parse mm/yyyy quickly
+    mm_yyyy_match = re.fullmatch(r"(\d{1,2})/(\d{4})", date_str)
     if mm_yyyy_match:
         month, year = mm_yyyy_match.groups()
         return f"{year}-{int(month):02d}-01"
-    
-    # Try to parse just year "2025"
-    year_match = re.match(r'^(\d{4})$', date_str)
+
+    # Parse bare year
+    year_match = re.fullmatch(r"(\d{4})", date_str)
     if year_match:
         return f"{date_str}-01-01"
-    
-    # Return as-is if can't parse
-    return date_str
+
+    # Fallback: dateutil fuzzy parsing for "May 2018", "Sep 2020", etc.
+    try:
+        default = datetime(2000, 1, 1)
+        dt = date_parser.parse(date_str, default=default, fuzzy=True, dayfirst=False)
+        # If the string contains only month+year (or only year), normalize to first day
+        return f"{dt.year:04d}-{dt.month:02d}-01"
+    except Exception:
+        return date_str
 
 def _extract_professional_summary(sections, raw_text):
     """Extract professional summary/objective from resume."""
@@ -113,8 +130,9 @@ def _extract_professional_summary(sections, raw_text):
     for key in ['summary', 'objective', 'profile', 'about']:
         if key in sections and sections[key].strip():
             summary_text = sections[key].strip()
-            # Return first 500 chars if too long
-            return summary_text[:500] if len(summary_text) > 500 else summary_text
+            # Normalize whitespace; allow longer summaries (avoid truncating mid-sentence)
+            summary_text = " ".join(summary_text.split())
+            return summary_text[:1200] if len(summary_text) > 1200 else summary_text
     
     # If no dedicated section, look for summary-like text after contact info
     lines = raw_text.split('\n')
@@ -139,14 +157,14 @@ def _extract_professional_summary(sections, raw_text):
         
         if summary_lines:
             summary_text = ' '.join(summary_lines)
-            # Return first 500 chars if too long
-            return summary_text[:500] if len(summary_text) > 500 else summary_text
+            summary_text = " ".join(summary_text.split())
+            return summary_text[:1200] if len(summary_text) > 1200 else summary_text
     
     return None
 
 def parse_resume(payload: dict) -> dict:
     # Extract text from S3 file
-    raw_text = extract_text(payload)
+    raw_text, extract_meta = extract_text_and_meta(payload)
     
     # Use regex parser for resume parsing
     sections = split_sections(raw_text)
@@ -156,6 +174,20 @@ def parse_resume(payload: dict) -> dict:
     skills = consolidate_skills(sections, experience, education)
     social_links = extract_social_links(raw_text)
     professional_summary = _extract_professional_summary(sections, raw_text)
+
+    # Always keep a bounded copy of raw sections in meta so nothing is "lost"
+    # even when structured parsing misses edge-cases.
+    meta_section_chars = int(os.getenv("RESUME_PARSER_META_SECTION_CHARS", "4000"))
+    meta_raw_text_chars = int(os.getenv("RESUME_PARSER_META_RAWTEXT_CHARS", "2000"))
+    raw_preview, raw_truncated = _truncate(raw_text, meta_raw_text_chars)
+    raw_sections_meta: dict = {}
+    for k, v in sections.items():
+        preview, truncated = _truncate(v, meta_section_chars)
+        raw_sections_meta[k] = {
+            "length": len(v or ""),
+            "preview": preview,
+            "truncated": truncated,
+        }
     
     # Convert dates to frontend format (dd-mm-yyyy)
     for exp in experience:
@@ -170,7 +202,7 @@ def parse_resume(payload: dict) -> dict:
         if edu.get('endDate'):
             edu['endDate'] = _convert_date_to_frontend_format(edu['endDate'])
 
-    return _to_profile_service_shape({
+    parsed = {
         "personal": personal,
         "professionalSummary": professional_summary,
         "experience": experience,
@@ -181,6 +213,19 @@ def parse_resume(payload: dict) -> dict:
             "sectionsFound": list(sections.keys()),
             "partial": not experience or not education,
             "parsed": True,
-            "parser": "regex"
+            "parser": "regex",
+            # Helps detect accidental cross-resume mixups or caching issues
+            "document": extract_meta,
+            "rawText": {
+                "length": len(raw_text or ""),
+                "preview": raw_preview,
+                "truncated": raw_truncated,
+            },
+            "rawSections": raw_sections_meta,
         }
-    })
+    }
+
+    # Apply consistency rules (dedupe, sorting, etc.) before shaping for profile-service.
+    parsed = postprocess_result(parsed)
+
+    return _to_profile_service_shape(parsed)

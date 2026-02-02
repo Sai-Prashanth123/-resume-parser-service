@@ -1,11 +1,18 @@
 
+import os
 import re
+
+
+_LOCATION_LINE_RE = re.compile(r"^(?P<city>[A-Za-z][A-Za-z.' \-]{1,40}),\s*(?P<country>[A-Za-z]{2,20})$")
+_LOCATION_SEGMENT_RE = re.compile(
+    r"(?P<city>[A-Za-z][A-Za-z.' \-]{1,40})\s*,\s*(?P<region>[A-Za-z]{2,3}|[A-Za-z][A-Za-z.' \-]{1,30})(?:\s*,\s*(?P<country>[A-Za-z][A-Za-z.' \-]{1,30}))?$"
+)
 
 def extract_personal(text):
     """
     Flexible personal details parser.
     Extracts name, email, phone from resume.
-    Leaves address/city/country empty (too error-prone).
+    Tries city/country only from top header lines (safe heuristics).
     """
     if not text:
         return {
@@ -13,9 +20,9 @@ def extract_personal(text):
             "lastName": None,
             "email": None,
             "phoneNumber": None,
-            "address": None,
-            "city": None,
-            "country": None
+            "address": "",
+            "city": "",
+            "country": ""
         }
     
     lines = [l for l in text.splitlines() if l.strip()]
@@ -51,15 +58,58 @@ def extract_personal(text):
             phone_number = phone_match.group(0).strip()
             break
     
-    # Don't extract address/city/country - too error-prone with various resume formats
-    # These fields will be left empty for manual entry
+    # Location extraction (safe): only from the first few lines near contact info.
+    # This avoids picking up cities/countries from experience section.
+    city = ""
+    country = ""
+    max_header_lines = int(os.getenv("RESUME_PARSER_PERSONAL_HEADER_LINES", "8"))
+    for ln in lines[:max_header_lines]:
+        ln = ln.strip()
+        if not ln:
+            continue
+        low = ln.lower()
+        if any(w in low for w in ["university", "college", "institute", "school", "company", "services", "consulting"]):
+            continue
+
+        # Many resumes put location + email + phone + links on one line separated by pipes.
+        # Example: "O'Fallon, MO | email | (202) ... | linkedin.com/..."
+        # Allow long contact lines, but avoid scanning huge paragraphs.
+        if len(ln) > 220 and "|" not in ln and "•" not in ln and "·" not in ln:
+            continue
+        segments = re.split(r"[|•·]", ln)
+        segments = [s.strip() for s in segments if s and s.strip()]
+
+        # Prefer early segments (location is usually first)
+        for seg in segments[:3]:
+            # Skip segments that are clearly not location
+            if "@" in seg or "http" in seg.lower():
+                continue
+            if any(ch.isdigit() for ch in seg):
+                continue
+
+            m = _LOCATION_SEGMENT_RE.fullmatch(seg)
+            if not m:
+                continue
+            c1 = m.group("city").strip()
+            region = (m.group("region") or "").strip()
+            ctry = (m.group("country") or "").strip()
+
+            # We only return city + country. If country is present, use it.
+            # Otherwise, use the region/state as "country" (UI uses this field for location).
+            city = c1
+            country = ctry if ctry else region
+            break
+        if city:
+            break
     
     return {
         "firstName": first_name,
         "lastName": last_name,
         "email": email,
         "phoneNumber": phone_number,
-        "address": None,
-        "city": None,
-        "country": None
+        # Important for data consistency:
+        # return empty strings for unknowns so downstream merges don't keep stale values.
+        "address": "",
+        "city": city,
+        "country": country
     }
