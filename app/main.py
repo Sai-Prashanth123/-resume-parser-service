@@ -9,16 +9,13 @@ import os
 
 from botocore.exceptions import NoCredentialsError, ClientError
 
-# Load .env automatically for local dev (AWS creds, region, etc.)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
-    # If python-dotenv isn't installed, env vars must be provided by the runtime
     pass
 
 app = FastAPI(title="Resume Parser (Parse-Only)")
-# Ensure INFO logs show up under uvicorn.
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("resume-parser")
 logger.setLevel(logging.INFO)
@@ -30,13 +27,39 @@ class ParseRequest(BaseModel):
     s3Bucket: str
     s3Key: str
     fileType: str
-    # Optional: if provided, service downloads via HTTPS instead of using AWS creds
     s3PresignedUrl: str | None = None
 
+def _normalize_file_type(file_type: str | None) -> str:
+    if not file_type:
+        raise HTTPException(status_code=400, detail="fileType is required")
+    ft = (file_type or "").strip()
+    if not ft:
+        raise HTTPException(status_code=400, detail="fileType is required")
+
+    ft_lower = ft.lower()
+    if "/" in ft_lower:
+        if ft_lower == "application/pdf":
+            return "PDF"
+        if ft_lower == "application/msword" or "msword" in ft_lower:
+            return "DOC"
+        if "officedocument.wordprocessingml.document" in ft_lower or "wordprocessingml" in ft_lower:
+            return "DOCX"
+        if "image/png" in ft_lower or ft_lower.endswith("png"):
+            return "PNG"
+        if "image/jpeg" in ft_lower or "image/jpg" in ft_lower or "jpeg" in ft_lower or "jpg" in ft_lower:
+            return "JPG"
+
+    token = ft_lower[1:] if ft_lower.startswith(".") else ft_lower
+    if token in {"pdf", "docx", "doc", "png", "jpg", "jpeg"}:
+        return token.upper() if token != "jpeg" else "JPEG"
+
+    upper = ft.upper()
+    if upper in {"PDF", "DOCX", "DOC", "PNG", "JPG", "JPEG"}:
+        return upper
+
+    raise HTTPException(status_code=400, detail=f"Unsupported fileType: {file_type}")
+
 def _validate_request(req: ParseRequest):
-    # Basic safety: ensure the key is scoped to the userId folder (prevents mismatches)
-    # Expected patterns: resumes/<userId>/... or .../<userId>/...
-    # If a presigned URL is provided, skip key validation (still requires bucket/key in payload for audit)
     if req.s3PresignedUrl:
         return
     if not re.search(rf"(^|/){re.escape(req.userId)}(/|$)", req.s3Key):
@@ -49,28 +72,35 @@ def _validate_request(req: ParseRequest):
 def parse_v1(req: ParseRequest):
     try:
         _validate_request(req)
-        result = parse_resume(req.dict())
+        payload = req.dict()
+        payload["fileType"] = _normalize_file_type(req.fileType)
 
-        # Print parsed response to logs (truncated) for debugging.
-        # You can disable by setting RESUME_PARSER_LOG_RESPONSE=false
-        if os.getenv("RESUME_PARSER_LOG_RESPONSE", "true").lower() in {"1", "true", "yes"}:
-            try:
-                dumped = json.dumps(result, ensure_ascii=False)
-                logger.info("Parsed resume userId=%s resumeId=%s response=%s", req.userId, req.resumeId, dumped[:4000])
-                # Fallback: some uvicorn setups may not show custom logger output.
-                # Printing guarantees the response appears in the terminal.
-                print(f"PARSED_RESUME_JSON userId={req.userId} resumeId={req.resumeId} {dumped[:4000]}", flush=True)
-            except Exception:
-                logger.info("Parsed resume userId=%s resumeId=%s (response not JSON-serializable)", req.userId, req.resumeId)
+        logger.info("Parse request userId=%s resumeId=%s fileType=%s s3Bucket=%s s3Key=%s presigned=%s",
+                    req.userId, req.resumeId, payload["fileType"], req.s3Bucket, req.s3Key, bool(req.s3PresignedUrl))
+        print(f"PARSE_REQUEST userId={req.userId} resumeId={req.resumeId} fileType={payload['fileType']} s3Key={req.s3Key}", flush=True)
+
+        if payload["fileType"] == "DOC":
+            raise HTTPException(status_code=400, detail="Legacy .doc files are not supported. Please upload a .docx file.")
+
+        result = parse_resume(payload)
+
+        max_chars = int(os.getenv("RESUME_PARSER_LOG_RESPONSE_CHARS", "12000"))
+        try:
+            dumped = json.dumps(result, ensure_ascii=False)
+            snippet = dumped if max_chars <= 0 else dumped[:max_chars]
+            logger.info("Parsed resume userId=%s resumeId=%s response=%s", req.userId, req.resumeId, snippet)
+            print(f"PARSED_RESUME_JSON userId={req.userId} resumeId={req.resumeId} {snippet}", flush=True)
+        except Exception:
+            logger.info("Parsed resume userId=%s resumeId=%s (response not JSON-serializable)", req.userId, req.resumeId)
         return result
     except HTTPException:
         raise
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except NoCredentialsError:
-        # AWS creds not present in this service environment
         logger.exception("AWS credentials not found")
         raise HTTPException(status_code=401, detail="AWS credentials not configured for resume-parser-service")
     except ClientError as e:
-        # Common S3 errors: NoSuchKey, AccessDenied, InvalidAccessKeyId, etc.
         code = (e.response.get("Error", {}) or {}).get("Code", "ClientError")
         msg = (e.response.get("Error", {}) or {}).get("Message", str(e))
         logger.exception("AWS ClientError: %s %s", code, msg)
@@ -82,11 +112,9 @@ def parse_v1(req: ParseRequest):
             raise HTTPException(status_code=401, detail=f"AWS credentials error: {code}")
         raise HTTPException(status_code=400, detail=f"AWS error: {code}")
     except Exception as e:
-        # Print full traceback to logs for debugging
         logger.exception("Unhandled error in /v1/parse")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Backwards/alternate path support (helps when gateway rewrites /parse)
 @app.post("/parse")
 def parse_alias(req: ParseRequest):
     return parse_v1(req)

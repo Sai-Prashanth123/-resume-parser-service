@@ -9,11 +9,6 @@ _LOCATION_SEGMENT_RE = re.compile(
 )
 
 def extract_personal(text):
-    """
-    Flexible personal details parser.
-    Extracts name, email, phone from resume.
-    Tries city/country only from top header lines (safe heuristics).
-    """
     if not text:
         return {
             "firstName": None,
@@ -26,29 +21,52 @@ def extract_personal(text):
         }
     
     lines = [l for l in text.splitlines() if l.strip()]
-    
-    # Extract name from first line
+
     first_name = None
     last_name = None
-    if lines:
-        name_parts = lines[0].strip().split()
-        # Only extract if it looks like a name (alphabetic characters, 1-4 words)
-        if 1 <= len(name_parts) <= 4:
-            valid_name = all(part.replace('-', '').replace("'", '').replace('.', '').isalpha() for part in name_parts)
-            if valid_name:
-                first_name = name_parts[0]
-                last_name = name_parts[-1] if len(name_parts) > 1 else None
+    max_header_lines = int(os.getenv("RESUME_PARSER_PERSONAL_HEADER_LINES", "8"))
+
+    def _looks_like_contact_or_header(ln: str) -> bool:
+        low = ln.lower()
+        if "@" in ln:
+            return True
+        if "http://" in low or "https://" in low or "www." in low:
+            return True
+        if any(ch.isdigit() for ch in ln):
+            return True
+        if any(k in low for k in ["linkedin", "github", "portfolio", "curriculum vitae", "resume"]):
+            return True
+        if low.strip() in {"summary", "professional summary", "experience", "work experience", "education", "skills", "projects"}:
+            return True
+        return False
+
+    for ln in lines[: max(25, max_header_lines * 3)]:
+        ln = ln.strip()
+        if not ln:
+            continue
+        seg = re.split(r"[|•·]", ln)[0].strip()
+        if not seg or _looks_like_contact_or_header(seg):
+            continue
+
+        name_parts = seg.split()
+        if not (1 <= len(name_parts) <= 4):
+            continue
+        valid_name = all(part.replace('-', '').replace("'", '').replace('.', '').isalpha() for part in name_parts)
+        if not valid_name:
+            continue
+
+        first_name = name_parts[0]
+        last_name = name_parts[-1] if len(name_parts) > 1 else None
+        break
     
-    # Extract email - standard email pattern
     email_match = re.search(r'\b[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}\b', text)
     email = email_match.group(0) if email_match else None
     
-    # Extract phone number - flexible pattern for international formats
     phone_patterns = [
-        r'\+\d{1,3}[\s.-]?\d{3,4}[\s.-]?\d{3,4}[\s.-]?\d{4}',  # +91 1234567890
-        r'\(\d{3}\)[\s.-]?\d{3}[\s.-]?\d{4}',  # (123) 456-7890
-        r'\d{3}[\s.-]?\d{3}[\s.-]?\d{4}',  # 123-456-7890
-        r'\+\d{10,15}'  # +911234567890
+        r'\+\d{1,3}[\s.-]?\d{3,4}[\s.-]?\d{3,4}[\s.-]?\d{4}',
+        r'\(\d{3}\)[\s.-]?\d{3}[\s.-]?\d{4}',
+        r'\d{3}[\s.-]?\d{3}[\s.-]?\d{4}',
+        r'\+\d{10,15}'
     ]
     
     phone_number = None
@@ -58,11 +76,8 @@ def extract_personal(text):
             phone_number = phone_match.group(0).strip()
             break
     
-    # Location extraction (safe): only from the first few lines near contact info.
-    # This avoids picking up cities/countries from experience section.
     city = ""
     country = ""
-    max_header_lines = int(os.getenv("RESUME_PARSER_PERSONAL_HEADER_LINES", "8"))
     for ln in lines[:max_header_lines]:
         ln = ln.strip()
         if not ln:
@@ -71,17 +86,12 @@ def extract_personal(text):
         if any(w in low for w in ["university", "college", "institute", "school", "company", "services", "consulting"]):
             continue
 
-        # Many resumes put location + email + phone + links on one line separated by pipes.
-        # Example: "O'Fallon, MO | email | (202) ... | linkedin.com/..."
-        # Allow long contact lines, but avoid scanning huge paragraphs.
         if len(ln) > 220 and "|" not in ln and "•" not in ln and "·" not in ln:
             continue
         segments = re.split(r"[|•·]", ln)
         segments = [s.strip() for s in segments if s and s.strip()]
 
-        # Prefer early segments (location is usually first)
         for seg in segments[:3]:
-            # Skip segments that are clearly not location
             if "@" in seg or "http" in seg.lower():
                 continue
             if any(ch.isdigit() for ch in seg):
@@ -94,8 +104,6 @@ def extract_personal(text):
             region = (m.group("region") or "").strip()
             ctry = (m.group("country") or "").strip()
 
-            # We only return city + country. If country is present, use it.
-            # Otherwise, use the region/state as "country" (UI uses this field for location).
             city = c1
             country = ctry if ctry else region
             break
@@ -107,8 +115,6 @@ def extract_personal(text):
         "lastName": last_name,
         "email": email,
         "phoneNumber": phone_number,
-        # Important for data consistency:
-        # return empty strings for unknowns so downstream merges don't keep stale values.
         "address": "",
         "city": city,
         "country": country

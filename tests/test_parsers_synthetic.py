@@ -187,7 +187,6 @@ def test_sectioner_does_not_split_on_key_technologies():
     )
     sections = split_sections(text)
     assert "experience" in sections
-    # Ensure the second role didn't get moved into skills by "Key Technologies:"
     assert "Freelance AI/ML Developer" in sections["experience"]
 
 
@@ -207,7 +206,6 @@ def test_experience_tech_list_wrapped_line_not_treated_as_location_header():
     sections = split_sections(text)
     exp = parse_experience(sections.get("experience", ""))
     assert len(exp) >= 2
-    # Second job should not inherit "Blob Storage, Docker" as city
     assert exp[1].get("city") != "Blob Storage, Docker"
 
 
@@ -226,5 +224,55 @@ def test_experience_title_pipe_company_and_remote_on_date_line():
     assert len(exp) >= 2
     assert exp[0].get("jobTitle") == "Product Designer"
     assert exp[0].get("employer") == "JobSpring"
-    assert (exp[0].get("city") or "").lower() in {"remote", ""}  # city may be "Remote"
+    assert (exp[0].get("city") or "").lower() in {"remote", ""}
 
+
+def test_experience_work_history_format_title_then_dates_then_company():
+    text = normalize_text(
+        """
+        WORK HISTORY
+        GEOTECHNICAL ENGINEERING MANAGER
+        06/2017 to Current
+        ECS Limited, Schererville, IN
+        • Plan and conduct exploration effectively.
+        • Develop design specifications and drawings.
+        GEOTECHNICAL ENGINEER
+        10/2010 to 06/2017
+        Milhaus Development LLC, Hammond, IN
+        • Analyzed over 100 survey reports.
+        """
+    )
+    sections = split_sections(text)
+    exp = parse_experience(sections.get("experience", ""))
+    assert len(exp) >= 2
+    e0 = exp[0]
+    assert e0.get("jobTitle") == "GEOTECHNICAL ENGINEERING MANAGER"
+    assert e0.get("employer") == "ECS Limited"
+    assert e0.get("city") == "Schererville, IN"
+    assert e0.get("startDate") is not None
+    assert e0.get("isCurrent") is True
+    e1 = exp[1]
+    assert "GEOTECHNICAL ENGINEER" in (e1.get("jobTitle") or "")
+    assert e1.get("employer") == "Milhaus Development LLC"
+    assert e1.get("city") == "Hammond, IN"
+
+
+def test_experience_title_dash_company_with_dates_on_same_line():
+    text = normalize_text(
+        """
+        Experience
+        Backend Developer – JobSpring
+        January 2025 – March 2025
+        • Built RESTful APIs for an AI-powered Interview Coach
+        • Deployed services on Azure with Docker
+        """
+    )
+    sections = split_sections(text)
+    exp = parse_experience(sections.get("experience", ""))
+    assert len(exp) >= 1
+    e0 = exp[0]
+    assert e0.get("jobTitle") == "Backend Developer"
+    assert e0.get("employer") == "JobSpring"
+    assert e0.get("startDate") is not None
+    assert e0.get("endDate") is not None
+    assert "RESTful" in (e0.get("description") or "")
