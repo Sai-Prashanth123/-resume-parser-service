@@ -68,7 +68,12 @@ def parse_experience(text):
 
     def _looks_like_role(text_line: str) -> bool:
         low = (text_line or "").lower()
-        return any(kw in low for kw in ROLE_KEYWORDS)
+        # Use word boundary matching to avoid false positives like 'FACTORY' matching 'cto'
+        for kw in ROLE_KEYWORDS:
+            # Match keyword as a whole word (with word boundaries)
+            if re.search(rf'\b{re.escape(kw)}\b', low):
+                return True
+        return False
 
     def _extract_date_range(line: str) -> tuple[Optional[str], Optional[str], bool]:
         if not line:
@@ -247,8 +252,20 @@ def parse_experience(text):
             return None
         if _looks_like_role(s) or "|" in s.lower():
             return None
+        
+        # Handle format: "COMPANY NAME - Description" or "COMPANY NAME - Location"
         parts = re.split(r"\s+[-–—]\s+", s, maxsplit=1)
         company = parts[0].strip() if parts else s
+        
+        # If there's a dash, check if the right part is a description/subtitle
+        if len(parts) == 2:
+            right_part = parts[1].strip()
+            # If right part looks like a company description (lowercase start, contains common words)
+            # then use the left part as company name
+            if right_part and (right_part[0].islower() or 
+                any(word in right_part.lower() for word in ["commerce", "grocery", "retail", "manufacturing", "technology"])):
+                company = parts[0].strip()
+        
         if _looks_like_location(company):
             return None
         if company.strip().lower() in WORK_MODE_TOKENS:
@@ -266,9 +283,18 @@ def parse_experience(text):
         m = re.split(r"\s+[-–—]\s+", s, maxsplit=1)
         if len(m) >= 2:
             left = m[0].strip()
+            right = m[1].strip() if len(m) > 1 else ""
             if left and not _looks_like_location(left):
                 if left.strip().lower() in WORK_MODE_TOKENS:
                     return None
+                # Check if right part looks like a company description (not a role, not a location)
+                # This handles "FRESH FOOD FACTORY - E-Commerce Grocery" format
+                if right and not _looks_like_role(right) and not _looks_like_location(right):
+                    # Right part is likely a description, left is the company
+                    return left
+                # Also return left if it's clearly a company name (uppercase, contains company keywords)
+                if left.isupper() or any(kw in left.lower() for kw in ["factory", "mill", "services", "consulting", "university", "college", "constructions"]):
+                    return left
                 return left
         return None
 
@@ -289,9 +315,10 @@ def parse_experience(text):
         ORG_STOP_WORDS = {
             "university", "college", "institute", "school", "academy",
             "services", "consulting", "factory", "mills", "mill", "construction", "constructions",
-            "company", "corp", "inc", "ltd", "llc",
+            "company", "corp", "inc", "ltd", "llc", "grocery", "e-commerce",
         }
 
+        # Find the rightmost comma - this is typically before the location
         last_comma = s.rfind(",")
         right = s[last_comma + 1 :].strip()
         left = s[:last_comma].rstrip()
@@ -302,6 +329,15 @@ def parse_experience(text):
             main = left.strip(" -–—,|")
             return main if main else s, right.title()
 
+        # Check if right part looks like a valid location (City, State or City)
+        # If it contains only 1-3 capitalized words, it's likely a location
+        right_words = right.split()
+        if len(right_words) <= 3 and all(w[0].isupper() if w else False for w in right_words):
+            # This looks like a simple location, use it directly
+            if _looks_like_location(right):
+                return left.strip(" -–—,|"), right
+        
+        # Otherwise, try to extract city from the left part before the comma
         words = left.split()
         city_words: list[str] = []
         for w in reversed(words):
@@ -361,6 +397,15 @@ def parse_experience(text):
             return None
         if not _looks_like_role(parts[0]):
             return None
+        
+        # Field of study / department keywords that should not be employers
+        FIELD_KEYWORDS = {
+            "management", "engineering", "technology", "operations", "finance", 
+            "marketing", "sales", "administration", "human resources", "supply chain",
+            "business", "analytics", "data science", "computer science", "information",
+            "accounting", "economics", "strategy", "consulting"
+        }
+        
         for candidate in parts[1:3]:
             low = candidate.lower()
             if low in WORK_MODE_TOKENS:
@@ -368,6 +413,12 @@ def parse_experience(text):
             if re.search(DATE_TOKEN, candidate, re.I):
                 continue
             if low.startswith("key "):
+                continue
+            # Skip if it looks like a field of study or department name
+            if any(keyword in low for keyword in FIELD_KEYWORDS):
+                continue
+            # Skip if it looks like another role description
+            if _looks_like_role(candidate):
                 continue
             return candidate
         return None
@@ -536,6 +587,10 @@ def parse_experience(text):
     current: Optional[_Entry] = None
     pending_headers: list[str] = []
     tech_list_continuation = False
+    
+    # Track last seen company info for multi-role entries under same company
+    last_company_name: Optional[str] = None
+    last_company_city: Optional[str] = None
 
     def _start_new_entry(start: Optional[str], end: Optional[str], is_current: bool, header_parts: list[str]):
         nonlocal current, out
@@ -577,7 +632,13 @@ def parse_experience(text):
 
         employer = employer_from_dash
         if not employer:
+            # Try to extract employer from lines with dash separator (e.g., "COMPANY - Description")
             for it in header_items:
+                # First try with the main field (location stripped)
+                employer = _extract_employer_from_dash_line(it["main"])
+                if employer:
+                    break
+                # Then try with the clean field (full line)
                 employer = _extract_employer_from_dash_line(it["clean"])
                 if employer:
                     break
@@ -618,10 +679,40 @@ def parse_experience(text):
                 job = parts[0] if parts else role_line
 
         if not job:
+            # First try to find a line that looks like a role
             for p in cleaned_parts:
-                if not _looks_like_location(p):
+                if _looks_like_role(p) and not _looks_like_location(p):
                     job = p
                     break
+            # If still no job, take the first non-location line
+            if not job:
+                for p in cleaned_parts:
+                    if not _looks_like_location(p):
+                        job = p
+                        break
+
+        # Common technical terms/acronyms that should NOT be employers
+        INVALID_EMPLOYER_TERMS = {
+            "erp", "wms", "tms", "sap", "crm", "sql", "python", "excel", "power bi",
+            "tableau", "alteryx", "hana", "s/4hana", "smart networks", "smart networks'",
+            "lean six sigma", "dmaic", "scor", "s&op", "kpi", "roi", "etl",
+            "city",  # Placeholder text
+        }
+        
+        def _is_valid_employer(emp: str) -> bool:
+            if not emp:
+                return False
+            emp_lower = emp.strip().lower().rstrip("'\"")
+            # Reject if it's a known invalid term
+            if emp_lower in INVALID_EMPLOYER_TERMS:
+                return False
+            # Reject if it's too short (likely an acronym)
+            if len(emp_lower) <= 3 and emp_lower.isupper():
+                return False
+            # Reject if it contains quotes (likely extracted from description)
+            if "'" in emp or '"' in emp:
+                return False
+            return True
 
         if not employer:
             for p in [it["main"] for it in header_items if not it.get("leading_dash")] + cleaned_parts:
@@ -633,11 +724,33 @@ def parse_experience(text):
                     continue
                 if isinstance(p, str) and p.strip().lower() in WORK_MODE_TOKENS:
                     continue
+                if not _is_valid_employer(p):
+                    continue
                 employer = p
                 break
 
+        # Validate the extracted employer
+        if employer and not _is_valid_employer(employer):
+            employer = None
+
         if employer and job and employer.strip().lower() == job.strip().lower():
             employer = _extract_employer_from_dash_line(" - ".join([employer, "x"])) or None
+
+        # Use nonlocal to access and update last_company tracking variables
+        nonlocal last_company_name, last_company_city
+        
+        # If we found a new employer, update the tracking variables
+        if employer:
+            last_company_name = employer
+            if city:
+                last_company_city = city
+        else:
+            # No employer found in header - use last seen company if available
+            # This handles multiple roles under the same company header
+            if last_company_name and job:
+                employer = last_company_name
+                if not city and last_company_city:
+                    city = last_company_city
 
         header_text = " ".join(cleaned_parts).lower()
         exp_type = "PROFESSIONAL"
@@ -742,6 +855,18 @@ def parse_experience(text):
                             if candidate_city:
                                 current.city = candidate_city
                         continue
+            
+            # Check if this line is a company name without location (uppercase, no role keywords)
+            # This handles cases where company appears on its own line above the role
+            if not start and not is_current and not "," in line:
+                cleaned_line = _clean_header_line(line)
+                if cleaned_line and len(cleaned_line) >= 3 and len(cleaned_line) <= 80:
+                    # If line is mostly uppercase or title case and doesn't look like a role
+                    if (cleaned_line.isupper() or cleaned_line.istitle()) and not _looks_like_role(cleaned_line):
+                        emp = _extract_employer_from_company_line(cleaned_line)
+                        if emp and not current.employer:
+                            current.employer = emp
+                            continue
 
         if current and _looks_like_location(line):
             cleaned_loc_line = _clean_header_line(line)

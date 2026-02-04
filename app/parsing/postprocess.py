@@ -31,17 +31,9 @@ def _dedupe_list_of_dicts(items: list[dict], key_fields: list[str]) -> list[dict
 
 
 def _sort_experience(items: list[dict]) -> list[dict]:
-    def key(it: dict):
-        sd = _parse_date_loose(it.get("startDate"))
-        ed = _parse_date_loose(it.get("endDate"))
-        is_current = bool(it.get("isCurrent")) or (it.get("endDate") in (None, "", "null") and sd is not None)
-        return (
-            0 if is_current else 1,
-            -(sd.timestamp() if sd else 0),
-            -(ed.timestamp() if ed else 0),
-        )
-
-    return sorted(items, key=key)
+    # Preserve the original order from the resume instead of sorting by date
+    # This maintains the order as it appears in the resume document
+    return items
 
 
 def _sort_education(items: list[dict]) -> list[dict]:

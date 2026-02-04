@@ -105,7 +105,16 @@ def extract_personal(text):
             ctry = (m.group("country") or "").strip()
 
             city = c1
-            country = ctry if ctry else region
+            # Only use region as country if it's not a 2-3 letter US state code
+            # This prevents US states like "MO" from being mapped as countries
+            if ctry:
+                country = ctry
+            elif region and len(region) > 3:
+                # If region is longer than 3 chars, it's likely a country name
+                country = region
+            else:
+                # Short region codes (2-3 chars) are likely US states, leave country empty
+                country = ""
             break
         if city:
             break
