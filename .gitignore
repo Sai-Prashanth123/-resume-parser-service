@@ -25,3 +25,7 @@ credentials.txt
 .idea/
 Thumbs.db
 Desktop.ini
+
+# Never commit real resumes
+*.pdf
+*.docx
